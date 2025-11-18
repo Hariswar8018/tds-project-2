@@ -10,3 +10,4 @@ beautifulsoup4
 pdfplumber
 pypdf
 python-multipart
+python-dotenv

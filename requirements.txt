@@ -3,7 +3,7 @@ uvicorn[standard]
 playwright
 requests
 pydantic
-google-generative-ai
+google-generativeai
 pandas
 numpy
 beautifulsoup4

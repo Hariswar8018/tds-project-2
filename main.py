@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict
 
 from playwright.async_api import async_playwright
 import google.generativeai as genai
-
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/render/project/.playwright"
 
 # ---------------------------------------------------------------------------
 # ENVIRONMENT VARIABLES (NO HARDCODED SECRETS)

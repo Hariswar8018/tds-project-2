@@ -11,4 +11,3 @@ pdfplumber
 pypdf
 python-multipart
 python-dotenv
-chromium

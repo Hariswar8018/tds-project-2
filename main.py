@@ -453,51 +453,22 @@ async def solve_quiz_chain(initial_url: str, email: str, secret: str):
 # ---------------------------------------------------------------------------
 @app.post("/")
 async def handle_quiz(request: Request):
-    """
-    Validate raw JSON (return 400 for invalid JSON), validate secret (403),
-    return 200 if secret valid, and start solver either synchronously or in a separate process.
-    """
-    # 1) parse raw JSON manually so we can return 400 on invalid JSON
     payload = await parse_raw_json(request)
 
-    # expected fields
-    email = payload.get("email")
-    secret = payload.get("secret")
-    url = payload.get("url")
-
-    if not email or not secret or not url:
-        raise HTTPException(status_code=400, detail="Missing required fields: email, secret, url")
-
-    # 2) validate secret
-    if secret != STUDENT_SECRET:
+    if payload.get("secret") != STUDENT_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # 3) return 200 to grader as required
-    resp = {"status": "accepted", "message": "Quiz solving started"}
-    # Start the solver either sync or as a separate process
-    if RUN_SYNCHRONOUS:
-        # Run solver inline (blocking) but still return 200 before we start heavy work is not possible here.
-        # We'll run solver synchronously and then return. Some hosts may kill long requests; use RUN_SYNCHRONOUS carefully.
-        try:
-            print("[Server] Running solver synchronously (blocking request)...")
-            await solve_quiz_chain(url, email, secret)
-        except Exception:
-            print("[Server] Sync solver failed:\n", traceback.format_exc())
-        return JSONResponse(status_code=200, content=resp)
-    else:
-        # spawn a separate process so the work continues outside of the request lifecycle
-        print("[Server] Spawning detached solver process...")
-        try:
-            p = multiprocessing.Process(target=run_solver_process, args=(url, email, secret))
-            p.daemon = False
-            p.start()
-            print(f"[Server] Spawned solver process pid={p.pid}")
-        except Exception:
-            print("[Server] Failed to spawn process; falling back to asyncio.create_task")
-            # fallback to in-process task (may be killed on some hosts)
-            asyncio.create_task(solve_quiz_chain(url, email, secret))
+    email = payload["email"]
+    secret = payload["secret"]
+    url = payload["url"]
 
-        return JSONResponse(status_code=200, content=resp)
+    # respond immediately
+    response = {"status": "accepted", "message": "Quiz solving started"}
+
+    # run solver in background within same process (safe on Railway)
+    asyncio.create_task(solve_quiz_chain(url, email, secret))
+
+    return response
 
 
 @app.get("/")

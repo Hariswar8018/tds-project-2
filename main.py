@@ -1,4 +1,6 @@
 # file: app.py
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/usr/local/share/pw-browsers"
+os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
 import os
 import time
 import json

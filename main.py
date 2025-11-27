@@ -29,8 +29,8 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Configuration - read from env
 # ---------------------------------------------------------------------------
-PLAYWRIGHT_BROWSERS_PATH = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_BROWSERS_PATH
+# Let Playwright use its default browser install path
+os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
 
 # REQUIRED (set these in your deployment environment)
 STUDENT_EMAIL = os.getenv("STUDENT_EMAIL")

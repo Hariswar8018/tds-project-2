@@ -1,191 +1,505 @@
+# file: app.py
 import os
 import time
 import json
 import traceback
 import asyncio
 import requests
+import multiprocessing
+from typing import Optional
+from urllib.parse import urljoin, urlparse
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel, ConfigDict
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
+# Playwright (async)
 from playwright.async_api import async_playwright
-import google.generativeai as genai
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/render/project/.playwright"
+
+# Optional parsing libraries - import only if installed
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
 
 # ---------------------------------------------------------------------------
-# ENVIRONMENT VARIABLES (NO HARDCODED SECRETS)
+# Configuration - read from env
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PLAYWRIGHT_BROWSERS_PATH = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_BROWSERS_PATH
+
+# REQUIRED (set these in your deployment environment)
 STUDENT_EMAIL = os.getenv("STUDENT_EMAIL")
 STUDENT_SECRET = os.getenv("STUDENT_SECRET")
 
-if not GEMINI_API_KEY or not STUDENT_EMAIL or not STUDENT_SECRET:
-    raise RuntimeError("Environment variables not set. Check GEMINI_API_KEY, STUDENT_EMAIL, STUDENT_SECRET.")
+if not STUDENT_EMAIL or not STUDENT_SECRET:
+    raise RuntimeError("Set STUDENT_EMAIL and STUDENT_SECRET environment variables.")
 
-genai.configure(api_key=GEMINI_API_KEY)
-llm_model = genai.GenerativeModel("gemini-2.5-flash")
+# Behavior:
+# If True, the solver runs inside the same request (blocking) - some hosts prefer this.
+# If False, solver is started as a separate process (recommended).
+RUN_SYNCHRONOUS = os.environ.get("RUN_SYNCHRONOUS", "false").lower() == "true"
 
+# Time limits
+TOTAL_TIMEOUT_SECONDS = 180  # 3 minutes total for the chain
 
-# ---------------------------------------------------------------------------
-# FASTAPI APP
-# ---------------------------------------------------------------------------
 app = FastAPI()
 
 
-class QuizRequest(BaseModel):
-    email: str
-    secret: str
-    url: str
-    model_config = ConfigDict(extra="ignore")
+# ---------------------------------------------------------------------------
+# Helper: safe JSON parse of raw request body -> return 400 if invalid JSON
+# ---------------------------------------------------------------------------
+async def parse_raw_json(request: Request):
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+    try:
+        data = json.loads(body.decode("utf-8"))
+        return data
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
 
 # ---------------------------------------------------------------------------
-# JS RENDERED PAGE SCRAPER (Playwright)
+# Playwright helper - fetch rendered HTML (wait for JS to run)
 # ---------------------------------------------------------------------------
-async def fetch_quiz_page(url: str) -> str:
+async def fetch_rendered_html(url: str, page_timeout: int = 60_000) -> str:
+    """
+    Use Playwright to fetch HTML after JS executes. Returns the final page.content().
+    """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         page = await browser.new_page()
         try:
-            await page.goto(url, timeout=30000)
-            await page.wait_for_load_state("domcontentloaded")
+            await page.goto(url, wait_until="networkidle", timeout=page_timeout)
+            # Give a tiny extra second for DOM mutation to settle
+            await asyncio.sleep(0.5)
             content = await page.content()
-            await browser.close()
             return content
-        except Exception as e:
+        finally:
+            await page.close()
             await browser.close()
-            raise e
 
 
 # ---------------------------------------------------------------------------
-# EXTRACT SUBMISSION URL + QUESTION USING LLM (safer approach)
+# DOM helpers executed with Playwright page - implemented inside solver
 # ---------------------------------------------------------------------------
-def parse_quiz_with_llm(html_content: str):
-    prompt = f"""
-You are an expert quiz parser.
 
-Extract the following from the HTML page:
-1. The quiz question (short text)
-2. The submission URL (where the answer must be POSTed)
-3. Any file URLs, table data, or API URLs required to solve it.
 
-Return a JSON object with:
-{{
-  "question": "...",
-  "submit_url": "...",
-  "data_sources": [...]
-}}
-"""
-
-    response = llm_model.generate_content(prompt + html_content)
-    raw = response.text
-
+# ---------------------------------------------------------------------------
+# Data extraction utils (deterministic patterns)
+# ---------------------------------------------------------------------------
+def sum_values_from_csv_url(csv_url: str) -> Optional[float]:
+    """
+    Download CSV and sum column named 'value' (case-insensitive).
+    Requires pandas to be installed.
+    """
+    if not pd:
+        return None
     try:
-        parsed = json.loads(raw)
-        return parsed
-    except:
-        # fallback: extract JSON inside text
+        # use requests to fetch csv
+        r = requests.get(csv_url, timeout=30)
+        r.raise_for_status()
+        from io import StringIO, BytesIO
+        content_type = r.headers.get("Content-Type", "")
+        data = r.content
+        # try reading with pandas
+        df = None
         try:
-            obj = json.loads(raw[raw.index("{"): raw.rindex("}")+1])
-            return obj
-        except:
-            raise RuntimeError("Failed to parse quiz metadata with LLM")
+            # try as text CSV
+            df = pd.read_csv(StringIO(r.text))
+        except Exception:
+            try:
+                # try bytes (excel-ish)
+                df = pd.read_csv(BytesIO(data))
+            except Exception:
+                return None
+        # find value-like column
+        cols = [c for c in df.columns if c.strip().lower() == "value"]
+        if not cols:
+            # try contains 'value'
+            cols = [c for c in df.columns if "value" in c.strip().lower()]
+        if not cols:
+            return None
+        col = cols[0]
+        s = pd.to_numeric(df[col], errors="coerce").fillna(0).sum()
+        return float(s)
+    except Exception:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# SOLVE QUIZ (deterministic general-purpose solver)
-# ---------------------------------------------------------------------------
-def solve_quiz(parsed_quiz: dict):
+def sum_values_from_pdf_bytes(pdf_bytes: bytes) -> Optional[float]:
     """
-    This is a placeholder. Real quizzes vary widely, so this function
-    attempts to solve common patterns (sum tables, read files, parse PDFs, etc.)
+    Try to extract table column named 'value' from a PDF bytes content using pdfplumber.
     """
-
-    # Example fallback: If no specific instructions, answer "OK"
-    return {"answer": "OK"}
-
-
-# ---------------------------------------------------------------------------
-# SUBMIT ANSWER
-# ---------------------------------------------------------------------------
-def submit_answer(submit_url: str, quiz_url: str, answer):
-    payload = {
-        "email": STUDENT_EMAIL,
-        "secret": STUDENT_SECRET,
-        "url": quiz_url,
-        "answer": answer
-    }
-
-    resp = requests.post(submit_url, json=payload)
+    if not pdfplumber:
+        return None
     try:
-        return resp.json()
-    except:
-        return {"correct": False, "reason": "Invalid server response"}
+        from io import BytesIO
+        s = 0.0
+        found = False
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                try:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        # Convert table to header + rows if possible
+                        if not table or len(table) < 2:
+                            continue
+                        headers = [str(h).strip().lower() for h in table[0]]
+                        if "value" in headers:
+                            idx = headers.index("value")
+                            for row in table[1:]:
+                                try:
+                                    val = row[idx]
+                                    if val is None:
+                                        continue
+                                    val = str(val).replace(",", "").strip()
+                                    s += float(val)
+                                    found = True
+                                except Exception:
+                                    continue
+                except Exception:
+                    continue
+        if found:
+            return float(s)
+        return None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
-# MAIN QUIZ WORKER (runs in background)
+# Main solver (runs in separate process or inline)
 # ---------------------------------------------------------------------------
-async def solve_quiz_chain(initial_url: str):
+def run_solver_process(start_url: str, email: str, secret: str):
+    """
+    This function runs in a separate process (not as FastAPI background task).
+    It's synchronous and uses asyncio internally for Playwright.
+    """
+    try:
+        asyncio.run(solve_quiz_chain(start_url, email, secret))
+    except Exception:
+        print("Solver top-level exception:\n", traceback.format_exc())
+
+
+async def solve_quiz_chain(initial_url: str, email: str, secret: str):
+    """
+    Main chain solver. Visits URL(s), extracts submit URL and data, computes answer(s), posts answers.
+    Respects TOTAL_TIMEOUT_SECONDS (3 minutes).
+    """
     start_time = time.time()
     current_url = initial_url
 
-    print("\n🧵 Worker started solving chain...\n")
+    print(f"[Solver] Starting chain for URL: {initial_url}")
 
     while True:
-        if time.time() - start_time > 170:
-            print("⏳ TIMEOUT: 3-minute limit exceeded.")
+        elapsed = time.time() - start_time
+        if elapsed > TOTAL_TIMEOUT_SECONDS:
+            print("[Solver] TIMEOUT reached - aborting chain.")
             return
 
         try:
-            html = await fetch_quiz_page(current_url)
-            parsed = parse_quiz_with_llm(html)
-            solution = solve_quiz(parsed)
-            response = submit_answer(parsed["submit_url"], current_url, solution["answer"])
+            # fetch rendered page HTML
+            print(f"[Solver] fetching: {current_url}")
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+                page = await browser.new_page()
+                try:
+                    await page.goto(current_url, wait_until="networkidle", timeout=60000)
+                    await asyncio.sleep(0.5)  # allow dynamic DOM to settle
 
-            print("🟦 Server Response:", response)
+                    # 1) Try to find a <pre> with JSON
+                    pre_handle = await page.query_selector("pre")
+                    if pre_handle:
+                        pre_text = (await pre_handle.inner_text()).strip()
+                        try:
+                            j = json.loads(pre_text)
+                            parsed = {"question": j.get("question"), "submit_url": j.get("submit_url"), "data_sources": j.get("data_sources", [])}
+                        except Exception:
+                            parsed = None
+                    else:
+                        parsed = None
 
-            if response.get("correct") is True:
-                next_url = response.get("url")
-                if not next_url:
-                    print("🏁 Quiz chain finished.")
-                    return
-                print(f"➡️ Next quiz URL: {next_url}")
-                current_url = next_url
-                continue
+                    # 2) If not found, try to find forms with action (submit URL)
+                    if not parsed:
+                        form_handle = await page.query_selector("form")
+                        submit_url = None
+                        if form_handle:
+                            submit_url = await form_handle.get_attribute("action")
+                            # it could be relative
+                            if submit_url and not submit_url.startswith("http"):
+                                submit_url = urljoin(current_url, submit_url)
+                        # 3) try data attributes / links
+                        if not submit_url:
+                            a_submit = await page.query_selector("a[data-submit-url], a[data-submit]")
+                            if a_submit:
+                                href = await a_submit.get_attribute("href") or await a_submit.get_attribute("data-submit-url") or await a_submit.get_attribute("data-submit")
+                                if href and not href.startswith("http"):
+                                    href = urljoin(current_url, href)
+                                submit_url = href
 
-            else:
-                # retry wrong attempt
-                print("🔁 Retrying wrong attempt...")
-                continue
+                        # 4) fallback: search page HTML for obvious submit endpoints (very common pattern)
+                        if not submit_url:
+                            html = await page.content()
+                            # crude search for https://.../submit
+                            import re
+                            m = re.search(r"https?://[^\s'\"<>]+/submit[^\s'\"<>]*", html)
+                            if m:
+                                submit_url = m.group(0)
 
-        except Exception as e:
-            print("❌ Worker error:", traceback.format_exc())
+                        # collect data_sources: any .csv or .pdf links on page
+                        data_sources = []
+                        links = await page.query_selector_all("a")
+                        for a in links:
+                            href = await a.get_attribute("href")
+                            if not href:
+                                continue
+                            href = href.strip()
+                            if not href.startswith("http"):
+                                href = urljoin(current_url, href)
+                            if href.lower().endswith(".csv") or href.lower().endswith(".pdf"):
+                                data_sources.append(href)
+
+                        # read a headline question text if present
+                        question_text = None
+                        h1 = await page.query_selector("h1")
+                        if h1:
+                            question_text = (await h1.inner_text()).strip()
+                        else:
+                            # try main #result or #question etc
+                            for sel in ["#result", "#question", ".question", ".quiz"]:
+                                node = await page.query_selector(sel)
+                                if node:
+                                    question_text = (await node.inner_text()).strip()
+                                    break
+
+                        parsed = {"question": question_text, "submit_url": submit_url, "data_sources": data_sources}
+
+                    # 5) Now attempt to compute an answer using deterministic handlers
+                    answer = None
+
+                    # If parsed contains data_sources with CSVs, try sum of 'value' column
+                    ds = parsed.get("data_sources", []) or []
+                    csv_found = False
+                    for src in ds:
+                        if src.lower().endswith(".csv"):
+                            csv_found = True
+                            total = sum_values_from_csv_url(src)
+                            if total is not None:
+                                print(f"[Solver] computed sum from CSV {src} => {total}")
+                                answer = total
+                                break
+
+                    # If PDF sources exist, try PDF parse
+                    if answer is None:
+                        for src in ds:
+                            if src.lower().endswith(".pdf"):
+                                try:
+                                    r = requests.get(src, timeout=30)
+                                    r.raise_for_status()
+                                    total = sum_values_from_pdf_bytes(r.content)
+                                    if total is not None:
+                                        print(f"[Solver] computed sum from PDF {src} => {total}")
+                                        answer = total
+                                        break
+                                except Exception:
+                                    continue
+
+                    # If no external files, try to parse any HTML table on the page
+                    if answer is None:
+                        # look for table header containing 'value'
+                        rows = await page.query_selector_all("table tr")
+                        if rows and len(rows) >= 2:
+                            # read header
+                            header_cells = await rows[0].query_selector_all("th,td")
+                            headers = [ (await c.inner_text()).strip().lower() for c in header_cells ]
+                            if "value" in headers:
+                                idx = headers.index("value")
+                                total = 0.0
+                                for r in rows[1:]:
+                                    cells = await r.query_selector_all("td")
+                                    if len(cells) > idx:
+                                        txt = (await cells[idx].inner_text()).strip().replace(",", "")
+                                        try:
+                                            total += float(txt)
+                                        except Exception:
+                                            pass
+                                answer = total
+                                print(f"[Solver] computed sum from HTML table => {answer}")
+
+                    # If still none, look for embedded base64 JSON inside script or atob pattern (common in sample)
+                    if answer is None:
+                        html = await page.content()
+                        import re, base64
+                        # find atob(`...`) occurrences
+                        m_all = re.findall(r"atob\(`([\s\S]*?)`\)", html)
+                        for enc in m_all:
+                            try:
+                                decoded = base64.b64decode(enc).decode("utf-8")
+                                # try to find numeric answer inside decoded JSON or text (common sample)
+                                try:
+                                    j = json.loads(decoded)
+                                    # sample format could include 'answer' key or instructions
+                                    if isinstance(j, dict) and j.get("answer") is not None:
+                                        answer = j.get("answer")
+                                        break
+                                except Exception:
+                                    # fallback: search for digits
+                                    digits = re.findall(r"[-+]?\d[\d,]*\.?\d*", decoded)
+                                    if digits:
+                                        # choose first numeric-looking token as candidate
+                                        candidate = digits[0].replace(",", "")
+                                        try:
+                                            answer = float(candidate) if "." in candidate else int(candidate)
+                                            break
+                                        except:
+                                            pass
+                            except Exception:
+                                continue
+
+                    # Very last fallback: if question asks yes/no pattern, send boolean 'true' (not ideal)
+                    if answer is None:
+                        q = parsed.get("question") or ""
+                        if isinstance(q, str) and q.strip():
+                            qlow = q.strip().lower()
+                            if qlow.startswith("is") or qlow.startswith("does") or qlow.startswith("are"):
+                                answer = True
+                            else:
+                                answer = "OK"
+
+                    # Build submit payload
+                    submit_url = parsed.get("submit_url")
+                    if not submit_url:
+                        # can't submit - fail this chain
+                        print("[Solver] No submit URL found on page; aborting this chain.")
+                        await page.close()
+                        await browser.close()
+                        return
+
+                    # Make submit payload (email/secret/url/answer) - follow spec
+                    payload = {"email": email, "secret": secret, "url": current_url, "answer": answer}
+                    print(f"[Solver] Submitting to {submit_url} payload: (answer truncated)")
+
+                    # Submit and examine response
+                    try:
+                        r = requests.post(submit_url, json=payload, timeout=30)
+                        # If non-200, log and continue (maybe stop)
+                        if r.status_code != 200:
+                            print(f"[Solver] Submit returned status {r.status_code}: {r.text}")
+                        resp_json = None
+                        try:
+                            resp_json = r.json()
+                        except Exception:
+                            resp_json = {"correct": False, "reason": "Non-JSON response"}
+
+                        print("[Solver] Server response:", resp_json)
+
+                        # If correct, and returns next url, continue; else if incorrect, we may retry or abort
+                        if resp_json.get("correct") is True:
+                            next_url = resp_json.get("url")
+                            if not next_url:
+                                print("[Solver] quiz chain finished successfully.")
+                                await page.close()
+                                await browser.close()
+                                return
+                            else:
+                                # normalize next_url
+                                if not next_url.startswith("http"):
+                                    next_url = urljoin(current_url, next_url)
+                                print(f"[Solver] Next URL received: {next_url}")
+                                current_url = next_url
+                                await page.close()
+                                await browser.close()
+                                continue
+                        else:
+                            # incorrect: optional retry logic - do one retry for robustness
+                            reason = resp_json.get("reason", "")
+                            print("[Solver] Answer incorrect or not accepted. Reason:", reason)
+                            # Attempt a simple retry logic: if we had CSV/HTML found, try alternate rounding
+                            # For now we'll break (to avoid endless loop). The grader allows resubmits within 3 minutes.
+                            await page.close()
+                            await browser.close()
+                            # Optional: small backoff then attempt again to current_url (if time remains)
+                            # Here we just stop to avoid infinite cycles.
+                            return
+                    except Exception as e:
+                        print("[Solver] Submit exception:", traceback.format_exc())
+                        await page.close()
+                        await browser.close()
+                        return
+
+                finally:
+                    # ensure cleaned up
+                    try:
+                        await page.close()
+                    except:
+                        pass
+                    try:
+                        await browser.close()
+                    except:
+                        pass
+
+        except Exception:
+            print("[Solver] Top loop exception:", traceback.format_exc())
             return
 
 
 # ---------------------------------------------------------------------------
-# API ENDPOINT — RETURNS 200 IMMEDIATELY (RULE REQUIREMENT)
+# Public endpoint
 # ---------------------------------------------------------------------------
 @app.post("/")
-async def handle_quiz(task: QuizRequest, bg: BackgroundTasks):
+async def handle_quiz(request: Request):
+    """
+    Validate raw JSON (return 400 for invalid JSON), validate secret (403),
+    return 200 if secret valid, and start solver either synchronously or in a separate process.
+    """
+    # 1) parse raw JSON manually so we can return 400 on invalid JSON
+    payload = await parse_raw_json(request)
 
-    print(f"\n📩 Incoming request: {task.url}")
+    # expected fields
+    email = payload.get("email")
+    secret = payload.get("secret")
+    url = payload.get("url")
 
-    # Validate secret
-    if task.secret != STUDENT_SECRET:
+    if not email or not secret or not url:
+        raise HTTPException(status_code=400, detail="Missing required fields: email, secret, url")
+
+    # 2) validate secret
+    if secret != STUDENT_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # Start background solving
-    bg.add_task(solve_quiz_chain, task.url)
+    # 3) return 200 to grader as required
+    resp = {"status": "accepted", "message": "Quiz solving started"}
+    # Start the solver either sync or as a separate process
+    if RUN_SYNCHRONOUS:
+        # Run solver inline (blocking) but still return 200 before we start heavy work is not possible here.
+        # We'll run solver synchronously and then return. Some hosts may kill long requests; use RUN_SYNCHRONOUS carefully.
+        try:
+            print("[Server] Running solver synchronously (blocking request)...")
+            await solve_quiz_chain(url, email, secret)
+        except Exception:
+            print("[Server] Sync solver failed:\n", traceback.format_exc())
+        return JSONResponse(status_code=200, content=resp)
+    else:
+        # spawn a separate process so the work continues outside of the request lifecycle
+        print("[Server] Spawning detached solver process...")
+        try:
+            p = multiprocessing.Process(target=run_solver_process, args=(url, email, secret))
+            p.daemon = False
+            p.start()
+            print(f"[Server] Spawned solver process pid={p.pid}")
+        except Exception:
+            print("[Server] Failed to spawn process; falling back to asyncio.create_task")
+            # fallback to in-process task (may be killed on some hosts)
+            asyncio.create_task(solve_quiz_chain(url, email, secret))
 
-    # Immediate response to grader (very important)
-    return {"status": "accepted", "message": "Quiz solving started"}
+        return JSONResponse(status_code=200, content=resp)
 
 
-# ---------------------------------------------------------------------------
-# HEALTH CHECK
-# ---------------------------------------------------------------------------
 @app.get("/")
 def home():
     return {"status": "Server is running"}

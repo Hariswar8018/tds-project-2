@@ -1,6 +1,4 @@
 # file: app.py
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/usr/local/share/pw-browsers"
-os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
 import os
 import time
 import json
@@ -10,7 +8,8 @@ import requests
 import multiprocessing
 from typing import Optional
 from urllib.parse import urljoin, urlparse
-
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/usr/local/share/pw-browsers"
+os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 

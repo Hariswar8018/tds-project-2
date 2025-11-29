@@ -8,8 +8,6 @@ import requests
 import multiprocessing
 from typing import Optional
 from urllib.parse import urljoin, urlparse
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/usr/local/share/pw-browsers"
-os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -27,11 +25,7 @@ try:
 except Exception:
     pdfplumber = None
 
-# ---------------------------------------------------------------------------
-# Configuration - read from env
-# ---------------------------------------------------------------------------
-# Let Playwright use its default browser install path
-os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+
 
 # REQUIRED (set these in your deployment environment)
 STUDENT_EMAIL = os.getenv("STUDENT_EMAIL")

@@ -1,15 +1,22 @@
 services:
   - type: web
-    name: tds-llm-backend
+    name: quiz-solver-api
     env: python
-    region: singapore
-    buildCommand: "pip install -r requirements.txt && playwright install chromium"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    region: oregon
     plan: free
+    branch: main
+    buildCommand: |
+      pip install -r requirements.txt
+      playwright install --with-deps chromium
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: GEMINI_API_KEY
-        sync: false
       - key: STUDENT_EMAIL
         sync: false
       - key: STUDENT_SECRET
         sync: false
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/.render/chrome
+    disk:
+      name: playwright-cache
+      mountPath: /opt/render/project/.render
+      sizeGB: 1

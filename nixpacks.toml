@@ -1,0 +1,30 @@
+[phases.setup]
+nixPkgs = ["python310"]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "playwright install-deps chromium",
+  "playwright install chromium"
+]
+
+[start]
+cmd = "uvicorn app:app --host 0.0.0.0 --port $PORT"
+```
+
+### **Step 2: Update Procfile**
+
+Your **`Procfile`** should now be simpler:
+```
+web: uvicorn app:app --host 0.0.0.0 --port $PORT
+```
+
+### **Step 3: Your Complete File Structure**
+```
+your-project/
+├── app.py              ← Your main application
+├── requirements.txt    ← Python dependencies
+├── Procfile           ← Simple start command
+├── nixpacks.toml      ← Railway build configuration (NEW!)
+├── .gitignore         
+└── README.md
